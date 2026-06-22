@@ -33,8 +33,6 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import psycopg2
-import sqlglot
-import sqlglot.expressions as exp
 
 from model import BaoRegression
 from reg_blocker import _ALL_OPTIONS, _arm_idx_to_hints
@@ -80,20 +78,66 @@ def _render_hint_comment(set_hints):
 
 
 # ---------------------------------------------------------------------------
-# SQL parsing (schema-agnostic alias extraction)
+# Buffer state snapshot (query-independent)
 # ---------------------------------------------------------------------------
-def extract_alias_to_table(sql):
-    """Parse SQL with sqlglot and return {alias_lower: table_name_lower}."""
-    alias_to_table = {}
+def _get_buffer_state(conn):
+    """
+    Build a {relation_name: block_count} dict representing the current
+    PostgreSQL shared buffer cache state.
+
+    This mirrors what the Bao C extension produces in `buffer_state()`
+    (pg_extension/bao_bufferstate.h): it iterates all NBuffers and counts
+    blocks per relation, excluding system tables. The result is attached to
+    every plan as a top-level "Buffers" field so Bao's featurize can derive
+    per-leaf buffer counts via `get_buffer_count_for_leaf`.
+
+    The buffer state is a snapshot of the cache at planning time and is
+    independent of the query being optimized — Bao uses it as a feature
+    that captures how much of each relation is already cached.
+
+    Requires the `pg_buffercache` extension to be installed on the target
+    database. Falls back to an empty dict if unavailable.
+    """
     try:
-        parsed = sqlglot.parse_one(sql)
-        for tbl in parsed.find_all(exp.Table):
-            alias = tbl.alias_or_name.lower()
-            if alias and alias not in alias_to_table:
-                alias_to_table[alias] = tbl.name.lower()
-    except Exception:
-        pass
-    return alias_to_table
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT c.relname, count(*) "
+                "FROM pg_buffercache b "
+                "JOIN pg_class c ON c.relfilenode = b.relfilenode "
+                "WHERE c.relname NOT LIKE 'pg\\_%' "
+                "  AND c.relname NOT LIKE 'sql\\_%' "
+                "GROUP BY c.relname"
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+    except psycopg2.Error as e:
+        print(f"[bao-wrapper] pg_buffercache query failed ({e}); "
+              f"using empty buffer state. Install pg_buffercache for full accuracy.",
+              file=sys.stderr)
+        return {}
+
+def _strip_per_node_buffers(plan_node):
+    """
+    Remove PostgreSQL's per-node buffer keys from an EXPLAIN plan tree.
+
+    EXPLAIN (ANALYZE, BUFFERS) annotates every node with individual
+    `Shared Hit Blocks` / `Shared Read Blocks` / etc. keys. Bao's featurize
+    only consumes the top-level `Buffers` dict (which we synthesize from
+    pg_buffercache), so we strip these per-node keys to avoid confusing the
+    TreeBuilder.
+    """
+    BUF_KEYS = ["Shared Hit Blocks", "Shared Read Blocks",
+                "Shared Dirtied Blocks", "Shared Written Blocks",
+                "Local Hit Blocks", "Local Read Blocks",
+                "Local Dirtied Blocks", "Local Written Blocks",
+                "Temp Read Blocks", "Temp Written Blocks"]
+
+    def recurse(n):
+        for k in BUF_KEYS:
+            n.pop(k, None)
+        for child in n.get("Plans", []) or []:
+            recurse(child)
+
+    recurse(plan_node)
 
 
 # ---------------------------------------------------------------------------
@@ -119,53 +163,6 @@ def _get_explain_plan(conn, sql, set_hints, with_analyze=False):
         if isinstance(plan, str):
             plan = json.loads(plan)
         return plan
-
-
-def _extract_buffer_info(plan_node, strip=True):
-    """
-    Walk an EXPLAIN (ANALYZE, BUFFERS) plan tree and build a
-    {relation_name: total_block_count} dict, which is what Bao's
-    add_buffer_info_to_plans expects (the PG extension normally provides
-    this). We sum Shared Hit / Read / Dirtied / Written blocks per relation.
-
-    PostgreSQL stores buffer counts as individual keys on each node, not
-    under a nested "Buffers" dict. If strip=True, also removes those
-    per-node keys so Bao's featurize only sees the top-level buffer dict
-    (matching the format the PG extension produces).
-    """
-    BUF_KEYS = ["Shared Hit Blocks", "Shared Read Blocks",
-                "Shared Dirtied Blocks", "Shared Written Blocks",
-                "Local Hit Blocks", "Local Read Blocks",
-                "Local Dirtied Blocks", "Local Written Blocks",
-                "Temp Read Blocks", "Temp Written Blocks"]
-    info = {}
-
-    def recurse(n):
-        hit = n.get("Shared Hit Blocks", 0) or 0
-        read = n.get("Shared Read Blocks", 0) or 0
-        dirtied = n.get("Shared Dirtied Blocks", 0) or 0
-        written = n.get("Shared Written Blocks", 0) or 0
-        total = hit + read + dirtied + written
-        if "Relation Name" in n:
-            rel = n["Relation Name"]
-            info[rel] = info.get(rel, 0) + total
-        if "Index Name" in n:
-            idx = n["Index Name"]
-            info[idx] = info.get(idx, 0) + hit + read
-        if strip:
-            for k in BUF_KEYS:
-                n.pop(k, None)
-        if "Plans" in n:
-            for child in n["Plans"]:
-                recurse(child)
-
-    recurse(plan_node)
-    return info
-
-
-def _attach_buffers(plan_entry, buf_info):
-    """Attach the synthesized buffer dict to the top-level plan entry."""
-    plan_entry["Buffers"] = buf_info
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +205,23 @@ def optimize(args):
     conn = psycopg2.connect(args.dsn)
     conn.autocommit = True
 
+    # Snapshot the buffer cache once (query-independent). Bao's featurize
+    # uses this as a per-plan feature.
+    buffer_state = _get_buffer_state(conn)
+
     # Build arm -> Set(...) hints map. Arm 0 (default) has no Set hints.
     arm_set_hints = {arm: _arm_to_set_hints(arm) for arm in range(5)}
 
     # Step 1: collect candidate plans from each arm via EXPLAIN (cost only).
-    arm_plans = []  # list of (arm_idx, explain_json_list, buf_info)
+    arm_plans = []  # list of (arm_idx, explain_json_list)
     for arm_idx in range(5):
         try:
             plan = _get_explain_plan(conn, args.query, arm_set_hints[arm_idx],
                                      with_analyze=False)
-            # Synthesize buffer dict from relation names (cost-only, so all
-            # zero counts — keeps feature dim consistent with training).
-            buf_info = _extract_buffer_info(plan[0]["Plan"], strip=True)
-            arm_plans.append((arm_idx, plan, buf_info))
+            # Strip per-node buffer keys (Bao only consumes the top-level
+            # buffer dict we synthesize).
+            _strip_per_node_buffers(plan[0]["Plan"])
+            arm_plans.append((arm_idx, plan))
         except Exception as e:
             print(f"[bao-wrapper] Arm {arm_idx} EXPLAIN failed: {e}",
                   file=sys.stderr)
@@ -244,9 +245,9 @@ def optimize(args):
     model = load_model(model_dir)
     arm_scores = []
     if model is not None:
-        for arm_idx, plan, buf in arm_plans:
+        for arm_idx, plan in arm_plans:
             try:
-                plan_entry = {"Plan": plan[0]["Plan"], "Buffers": buf}
+                plan_entry = {"Plan": plan[0]["Plan"], "Buffers": buffer_state}
                 pred = model.predict([plan_entry])
                 arm_scores.append((arm_idx, float(pred[0][0])))
             except Exception as e:
@@ -283,8 +284,9 @@ def optimize(args):
                                          with_analyze=True)
                 plan_entry = plan[0]
                 exec_time = plan_entry.get("Execution Time", 0.0)
-                buf_info = _extract_buffer_info(plan_entry["Plan"], strip=True)
-                _attach_buffers(plan_entry, buf_info)
+                # Strip per-node buffer keys, then attach the cache snapshot.
+                _strip_per_node_buffers(plan_entry["Plan"])
+                plan_entry["Buffers"] = buffer_state
                 storage.record_reward(plan_entry, float(exec_time), os.getpid())
 
             experiences = storage.experience()
@@ -312,6 +314,7 @@ def optimize(args):
             "mode": mode,
             "model_loaded": model is not None,
             "retrained": trained,
+            "buffer_state_relations": len(buffer_state),
         },
     }
 
